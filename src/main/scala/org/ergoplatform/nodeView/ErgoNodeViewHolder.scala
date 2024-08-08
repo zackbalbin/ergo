@@ -29,8 +29,6 @@ import org.ergoplatform.modifiers.history.extension.Extension
 
 import scala.annotation.tailrec
 import scala.collection.mutable
-import scala.concurrent.Future
-import scala.concurrent.ExecutionContext.Implicits.global
 import scala.util.{Failure, Success, Try}
 
 /**
@@ -492,40 +490,45 @@ abstract class ErgoNodeViewHolder[State <: ErgoState[State]](settings: ErgoSetti
                   val fullBlockHeight = newHistory.fullBlockHeight
                   val almostSynced = (headersHeight - fullBlockHeight) < almostSyncedGap
 
-                  val newMemPoolFuture = if (almostSynced) {
-                    Future {
-                      updateMemPool(progressInfo.toRemove, blocksApplied, memoryPool())
+                  val newMemPool = if (almostSynced) {
+                    updateMemPool(progressInfo.toRemove, blocksApplied, memoryPool())
+                  } else {
+                    memoryPool()
+                  }
+
+                  @SuppressWarnings(Array("org.wartremover.warts.OptionPartial"))
+                  val v = vault()
+                  val newVault = if (progressInfo.chainSwitchingNeeded) {
+                    v.rollback(idToVersion(progressInfo.branchPoint.get)) match {
+                      case Success(nv) => nv
+                      case Failure(e) => log.warn("Wallet rollback failed: ", e); v
                     }
                   } else {
-                    Future.successful(memoryPool())
+                    v
                   }
 
-                  newMemPoolFuture.onComplete {
-                    case Success(newMemPool) =>
-                      updateNodeView(Some(newHistory), Some(newMinState), Some(vault()), Some(newMemPool))
-
-                      // if blockchain is synced,
-                      // send an order to clean mempool up from transactions possibly become invalid
-                      // we can check mempool transactions only in "utxo" mode
-                      newMinState match {
-                        case utxoStateReader: UtxoStateReader if headersHeight == fullBlockHeight =>
-                          val recheckCommand = RecheckMempool(utxoStateReader, newMemPool)
-                          context.system.eventStream.publish(recheckCommand)
-                        case _ =>
-                      }
-
-                      log.info(s"Persistent modifier ${pmod.encodedId} applied successfully")
-                      chainProgress =
-                        Some(ChainProgress(pmod, headersHeight, fullBlockHeight, System.currentTimeMillis()))
-
-                      if (progressInfo.chainSwitchingNeeded) {
-                        context.system.eventStream.publish(Rollback(progressInfo.branchPoint.get))
-                      }
-                    case Failure(e) =>
-                      log.error(s"Failed to update mempool: ${e.getMessage}")
-                      // Handle the failure case appropriately
+                  if (almostSynced) {
+                    blocksApplied.foreach(newVault.scanPersistent)
                   }
 
+                  // if blockchain is synced,
+                  // send an order to clean mempool up from transactions possibly become invalid
+                  // we can check mempool transactions only in "utxo" mode
+                  newMinState match {
+                    case utxoStateReader: UtxoStateReader if headersHeight == fullBlockHeight =>
+                      val recheckCommand = RecheckMempool(utxoStateReader, newMemPool)
+                      context.system.eventStream.publish(recheckCommand)
+                    case _ =>
+                  }
+
+                  log.info(s"Persistent modifier ${pmod.encodedId} applied successfully")
+                  updateNodeView(Some(newHistory), Some(newMinState), Some(newVault), Some(newMemPool))
+                  chainProgress =
+                    Some(ChainProgress(pmod, headersHeight, fullBlockHeight, System.currentTimeMillis()))
+
+                  if (progressInfo.chainSwitchingNeeded) {
+                    context.system.eventStream.publish(Rollback(progressInfo.branchPoint.get))
+                  }
                 case Failure(e) =>
                   log.warn(s"Can`t apply persistent modifier (id: ${pmod.encodedId}, contents: $pmod) to minimal state", e)
                   updateNodeView(updatedHistory = Some(newHistory))
